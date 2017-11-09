@@ -10,6 +10,13 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
+	"context"
+	"sync"
+)
+
+var (
+	ErrTimeoutReady = errors.New("the server is still not ready")
 )
 
 func NewResponsePacket(msgID int) *Packet {
@@ -80,6 +87,10 @@ type Server struct {
 	RootDSE map[string][]string
 
 	tlsConfig *tls.Config
+
+	ready  chan struct{}
+	close  chan struct{}
+	closed chan struct{}
 }
 
 type srvClient struct {
@@ -106,6 +117,9 @@ func NewServer(be Backend, tlsConfig *tls.Config) (*Server, error) {
 		Backend:   be,
 		RootDSE:   sf,
 		tlsConfig: tlsConfig,
+		ready:     make(chan struct{}),
+		close:     make(chan struct{}),
+		closed:    make(chan struct{}),
 	}, nil
 }
 
@@ -131,19 +145,64 @@ func (srv *Server) Serve(network, addr string) error {
 	return srv.serve(ln)
 }
 
+func (srv *Server) WaitReady(timeout time.Duration) error {
+	ctx, cancle := context.WithTimeout(context.Background(), timeout)
+
+	select {
+	case <-srv.ready:
+		cancle()
+		return nil
+	case <-ctx.Done():
+		return ErrTimeoutReady
+	}
+}
+
+func (srv *Server) Close() {
+	close(srv.close)
+	<-srv.closed
+}
+
 func (srv *Server) serve(ln net.Listener) error {
+
+	go func() {
+		<-srv.close
+
+		ln.Close()
+	}()
+
+	wg := sync.WaitGroup{}
+
+	go func() {
+		wg.Wait()
+		close(srv.closed)
+	}()
+
+	close(srv.ready)
 	for {
 		cn, err := ln.Accept()
 		if err != nil {
-			log.Printf("Accept failed: %+v", err)
-			continue
+			select {
+			case <-srv.close:
+				return nil
+			default:
+				// some real error
+
+				log.Printf("Accept failed: %+v", err)
+				continue
+			}
 		}
 
-		go (&srvClient{
-			cn:  cn,
-			wr:  bufio.NewWriter(cn),
-			srv: srv,
-		}).serve()
+		go func() {
+			wg.Add(1)
+
+			(&srvClient{
+				cn:  cn,
+				wr:  bufio.NewWriter(cn),
+				srv: srv,
+			}).serve()
+
+			wg.Done()
+		}()
 	}
 }
 
